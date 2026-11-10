@@ -24,15 +24,37 @@ const { getPublicAnnouncements } = require("./controllers/publicController");
 const app = express();
 
 // Middlewares
+// CORS. The deployed frontend lives on a *.vercel.app domain that changes every
+// time the project is re-created (sportshub-alpha -> sportshub-zeta), so a pure
+// allow-list silently stopped sending Access-Control-Allow-Origin and the
+// browser reported it as an opaque CORS failure. Explicit origins still win,
+// Vercel deployments and local dev are always trusted, and an unset
+// CORS_ORIGINS keeps the old "allow everything" behaviour.
 const corsOrigins = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((o) => o.trim())
   .filter(Boolean);
 
+const isTrustedOrigin = (origin) =>
+  /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.vercel\.app$/i.test(origin) ||
+  /^http:\/\/localhost(:\d+)?$/i.test(origin) ||
+  /^http:\/\/127\.0\.0\.1(:\d+)?$/i.test(origin);
+
 app.use(
   cors({
-    origin: corsOrigins.length ? corsOrigins : true,
+    origin: (origin, callback) => {
+      // No Origin header: same-origin, curl or server-to-server call.
+      if (!origin) return callback(null, true);
+      if (corsOrigins.includes(origin)) return callback(null, true);
+      if (isTrustedOrigin(origin)) return callback(null, true);
+      if (!corsOrigins.length) return callback(null, true);
+
+      // Visible in the Vercel function logs instead of failing silently.
+      console.warn(`[cors] Origin not in CORS_ORIGINS: ${origin}`);
+      return callback(null, false);
+    },
     credentials: true,
+    optionsSuccessStatus: 204,
   })
 );
 app.use(express.json({ limit: "15mb" }));
