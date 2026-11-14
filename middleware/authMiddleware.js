@@ -1,6 +1,25 @@
 
 const jwt = require("jsonwebtoken");
 
+/**
+ * Turns a decoded token into the request user.
+ *
+ * Club tokens carry three things:
+ *   userId   - global identity (Users.UserID)
+ *   clubId   - the club this session is scoped to (drives row level security)
+ *   role     - the role *inside that club* ('admin' | 'coach' | 'user')
+ *
+ * Platform tokens have `platform: true` and `role: 'super_admin'`, and are the
+ * only sessions allowed to look across clubs.
+ */
+const buildUser = (decoded) => ({
+  userId: decoded.userId,
+  UserID: decoded.userId,
+  role: decoded.role,
+  Role: decoded.role,
+  clubId: decoded.clubId != null ? decoded.clubId : null,
+  platform: Boolean(decoded.platform),
+});
 
 const protect = (req, res, next) => {
   try {
@@ -17,12 +36,7 @@ const protect = (req, res, next) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    req.user = {
-      userId: decoded.userId,
-      UserID: decoded.userId,
-      role: decoded.role,
-      Role: decoded.role,
-    };
+    req.user = buildUser(decoded);
 
     next();
   } catch (error) {
@@ -66,4 +80,4 @@ const coachOrAdmin = (req, res, next) => {
   });
 };
 
-module.exports = { protect, adminOnly, coachOnly, coachOrAdmin };
+module.exports = { protect, adminOnly, coachOnly, coachOrAdmin, buildUser };

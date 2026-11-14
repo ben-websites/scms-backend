@@ -9,6 +9,9 @@ const { sql, getPool } = require("../config/db");
  * @param {string} params.message - Notification detailed content
  * @param {string} [params.type='system'] - Category: 'membership', 'payment', 'voucher', 'event', 'announcement', 'sports', 'admin', 'system'
  * @param {string|null} [params.link=null] - Target frontend route
+ * @param {number|null} [params.clubId=null] - Target club; defaults to the
+ *   request's tenant. Pass it explicitly when writing outside a tenant
+ *   context (the platform console, the approve flow).
  */
 const createNotification = async ({
   userId = null,
@@ -17,22 +20,36 @@ const createNotification = async ({
   message,
   type = "system",
   link = null,
+  clubId = null,
 }) => {
   try {
     const pool = getPool();
-    const result = await pool
+    const request = pool
       .request()
       .input("UserID", sql.Int, userId)
       .input("Role", sql.NVarChar(20), role)
       .input("Title", sql.NVarChar(255), title)
       .input("Message", sql.NVarChar(sql.MAX), message)
       .input("Type", sql.NVarChar(50), type)
-      .input("Link", sql.NVarChar(255), link)
-      .query(`
-        INSERT INTO Notifications (UserID, Role, Title, Message, Type, Link, IsRead, CreatedAt)
-        OUTPUT INSERTED.NotificationID, INSERTED.CreatedAt
-        VALUES (@UserID, @Role, @Title, @Message, @Type, @Link, 0, SYSDATETIME())
-      `);
+      .input("Link", sql.NVarChar(255), link);
+
+    // Notifications are tenant rows. Inside a request the column default
+    // (current_club()) already picks the right club; the explicit branch exists
+    // so a platform-level caller can target one club without a tenant context.
+    let columns = "UserID, Role, Title, Message, Type, Link, IsRead, CreatedAt";
+    let values = "@UserID, @Role, @Title, @Message, @Type, @Link, 0, SYSDATETIME()";
+
+    if (clubId) {
+      request.input("ClubID", sql.Int, clubId);
+      columns = `ClubID, ${columns}`;
+      values = `@ClubID, ${values}`;
+    }
+
+    const result = await request.query(`
+      INSERT INTO Notifications (${columns})
+      OUTPUT INSERTED.NotificationID, INSERTED.CreatedAt
+      VALUES (${values})
+    `);
 
     return result.recordset[0];
   } catch (error) {
@@ -42,9 +59,9 @@ const createNotification = async ({
 };
 
 /**
- * Convenience helper to send notification to all admins
+ * Convenience helper to send notification to all admins of one club
  */
-const notifyAdmins = async ({ title, message, type = "admin", link = null }) => {
+const notifyAdmins = async ({ title, message, type = "admin", link = null, clubId = null }) => {
   return createNotification({
     userId: null,
     role: "admin",
@@ -52,13 +69,14 @@ const notifyAdmins = async ({ title, message, type = "admin", link = null }) => 
     message,
     type,
     link,
+    clubId,
   });
 };
 
 /**
  * Convenience helper to send notification to a specific user
  */
-const notifyUser = async ({ userId, title, message, type = "system", link = null }) => {
+const notifyUser = async ({ userId, title, message, type = "system", link = null, clubId = null }) => {
   return createNotification({
     userId,
     role: "user",
@@ -66,13 +84,14 @@ const notifyUser = async ({ userId, title, message, type = "system", link = null
     message,
     type,
     link,
+    clubId,
   });
 };
 
 /**
  * Convenience helper to send broadcast to all members
  */
-const notifyAllMembers = async ({ title, message, type = "announcement", link = null }) => {
+const notifyAllMembers = async ({ title, message, type = "announcement", link = null, clubId = null }) => {
   return createNotification({
     userId: null,
     role: "user",
@@ -80,6 +99,7 @@ const notifyAllMembers = async ({ title, message, type = "announcement", link = 
     message,
     type,
     link,
+    clubId,
   });
 };
 

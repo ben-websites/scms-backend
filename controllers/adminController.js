@@ -101,11 +101,16 @@ const getDashboardStats = async (req, res) => {
     const pool = getPool();
     const finePerDay = await getFineSetting();
 
-    // 1. Overview counts
-    const counts = await pool.request().query(`
+    // 1. Overview counts - every number is this club's own data. Users is a
+    // global table, so counting it directly leaked other tenants into the
+    // dashboard (Total Users showed the whole platform).
+    const counts = await pool
+      .request()
+      .input("ClubID", sql.Int, Number(req.user.clubId))
+      .query(`
       SELECT
-        (SELECT COUNT(*) FROM Users) AS TotalUsers,
-        (SELECT COUNT(*) FROM Users WHERE Role = 'user') AS TotalRegisteredUsers,
+        (SELECT COUNT(DISTINCT m.UserID) FROM Memberships m WHERE m.ClubID = @ClubID) AS TotalUsers,
+        (SELECT COUNT(*) FROM ClubUsers cu WHERE cu.ClubID = @ClubID AND cu.Role = 'member') AS TotalRegisteredUsers,
         (SELECT COUNT(*) FROM Memberships WHERE MembershipStatus = 'Active') AS ActiveMembers,
         (SELECT COUNT(*) FROM MembershipApplications WHERE ApplicationStatus = 'Pending') AS PendingApplications,
         (SELECT COUNT(*) FROM Payments WHERE PaymentStatus = 'Pending') AS PendingPayments,
@@ -193,24 +198,53 @@ const getDashboardStats = async (req, res) => {
 // 2. USER MANAGEMENT
 const getAllUsers = async (req, res) => {
   try {
-    const pool = getPool();
-    const result = await pool.request().query(`
-      SELECT
-        u.UserID,
-        u.FullName,
-        u.Email,
-        u.Phone,
-        u.Role,
-        u.IsActive,
-        u.CreatedAt,
-        m.MembershipNumber,
-        m.MembershipStatus,
-        p.PlanName
-      FROM Users u
-      LEFT JOIN Memberships m ON m.UserID = u.UserID
-      LEFT JOIN MembershipPlans p ON p.PlanID = m.PlanID
-      ORDER BY u.CreatedAt DESC
-    `);
+    const clubId = Number(req.user.clubId);
+
+    // Only this club's paying members.
+    //
+    // Users is a global table (no ClubID, no RLS), so selecting from it alone
+    // used to list every account on the platform - other clubs' members, their
+    // admins, coaches and the platform owner. The two joins below are the
+    // definition of "our member": a ClubUsers row with role 'member' in THIS
+    // club, plus at least one membership record created when they took a plan.
+    // One row per person: the newest membership wins, so a renewal does not
+    // duplicate the member.
+    const result = await getPool()
+      .request()
+      .input("ClubID", sql.Int, clubId)
+      .query(`
+        SELECT
+          u.UserID,
+          u.FullName,
+          u.Email,
+          u.Phone,
+          u.CreatedAt,
+          cu.Role AS ClubRole,
+          cu.IsActive,
+          cu.JoinedAt,
+          m.MembershipNumber,
+          m.MembershipStatus,
+          m.StartDate,
+          m.EndDate,
+          p.PlanName,
+          p.MonthlyFee
+        FROM ClubUsers cu
+        INNER JOIN Users u ON u.UserID = cu.UserID
+        INNER JOIN Memberships m
+          ON m.UserID = cu.UserID
+         AND m.ClubID = @ClubID
+         AND NOT EXISTS (
+           SELECT 1 FROM Memberships newer
+           WHERE newer.UserID = m.UserID
+             AND newer.ClubID = m.ClubID
+             AND newer.MembershipID > m.MembershipID
+         )
+        LEFT JOIN MembershipPlans p ON p.PlanID = m.PlanID
+        WHERE cu.ClubID = @ClubID
+          AND cu.Role = 'member'
+          AND u.Role <> 'super_admin'
+        ORDER BY u.FullName ASC
+      `);
 
     return res.status(200).json({
       success: true,
@@ -227,46 +261,78 @@ const getAllUsers = async (req, res) => {
 
 const toggleUserStatus = async (req, res) => {
   try {
-    const targetUserId = req.params.id;
+    const targetUserId = Number(req.params.id);
     const adminId = req.user.userId;
+    const clubId = Number(req.user.clubId);
     const pool = getPool();
 
-    const userRes = await pool
-      .request()
-      .input("UserID", sql.Int, targetUserId)
-      .query("SELECT UserID, FullName, IsActive, Role FROM Users WHERE UserID = @UserID");
-
-    if (userRes.recordset.length === 0) {
-      return res.status(404).json({ success: false, message: "User not found." });
+    if (!Number.isInteger(targetUserId)) {
+      return res.status(400).json({ success: false, message: "Invalid member id." });
     }
 
-    const current = userRes.recordset[0];
-    const newStatus = current.IsActive ? 0 : 1;
-
-    await pool
+    // The target must be a member of THIS club. Without this check any user id
+    // on the platform could be suspended from here.
+    const memberRes = await pool
       .request()
       .input("UserID", sql.Int, targetUserId)
+      .input("ClubID", sql.Int, clubId)
+      .query(`
+        SELECT cu.ClubUserID, cu.IsActive, u.FullName
+        FROM ClubUsers cu
+        INNER JOIN Users u ON u.UserID = cu.UserID
+        WHERE cu.UserID = @UserID
+          AND cu.ClubID = @ClubID
+          AND cu.Role = 'member'
+          AND EXISTS (
+            SELECT 1 FROM Memberships m
+            WHERE m.UserID = cu.UserID AND m.ClubID = @ClubID
+          )
+      `);
+
+    if (memberRes.recordset.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "That member is not part of this club.",
+      });
+    }
+
+    const current = memberRes.recordset[0];
+    const newStatus = current.IsActive ? 0 : 1;
+
+    const clubRes = await pool
+      .request()
+      .input("ClubID", sql.Int, clubId)
+      .query("SELECT ClubName FROM Clubs WHERE ClubID = @ClubID");
+
+    const clubName = clubRes.recordset[0]?.ClubName || "the club";
+
+    // Club access only: ClubUsers.IsActive is what the login and club chooser
+    // read, and it leaves the person's account (and any membership of another
+    // club) untouched.
+    await pool
+      .request()
+      .input("ClubUserID", sql.Int, current.ClubUserID)
       .input("IsActive", sql.Bit, newStatus)
-      .query("UPDATE Users SET IsActive = @IsActive WHERE UserID = @UserID");
+      .query("UPDATE ClubUsers SET IsActive = @IsActive WHERE ClubUserID = @ClubUserID");
 
     await logAdminAction(
       adminId,
       "USER_STATUS_TOGGLE",
-      `Toggled status for user ${current.FullName} to ${newStatus ? "Active" : "Inactive"}`,
-      "Users",
+      `Set club access for member ${current.FullName} to ${newStatus ? "Active" : "Inactive"}`,
+      "ClubUsers",
       targetUserId
     );
 
     await Promise.all([
       notifyUser({
         userId: targetUserId,
-        title: "Account Status Update",
-        message: `Your account access has been ${newStatus ? "activated" : "deactivated"} by club administration.`,
+        title: "Club Access Update",
+        message: `Your access to ${clubName} has been ${newStatus ? "activated" : "deactivated"} by the club administration.`,
         type: "system",
       }),
       notifyAdmins({
-        title: "User Status Changed",
-        message: `User ${current.FullName} was set to ${newStatus ? "Active" : "Inactive"}.`,
+        title: "Member Access Changed",
+        message: `Member ${current.FullName} was set to ${newStatus ? "Active" : "Inactive"} in ${clubName}.`,
         type: "admin",
         link: "/admin/users",
       }),
@@ -274,7 +340,7 @@ const toggleUserStatus = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      message: `User account has been ${newStatus ? "activated" : "deactivated"}.`,
+      message: `Member access has been ${newStatus ? "activated" : "deactivated"} for this club.`,
     });
   } catch (error) {
     console.error("toggleUserStatus error:", error);

@@ -3,13 +3,15 @@ const cors = require("cors");
 const path = require("path");
 require("dotenv").config();
 
-const { connectDB, getPool } = require("./config/db");
+const { connectDB, getPool, runWithTenant, runWithPlatform } = require("./config/db");
 const { ensureSchema } = require("./db/initSchema");
 const { seedInitialData } = require("./utils/seedData");
 
 // Import Routes
 const authRoutes = require("./routes/authRoutes");
 const publicRoutes = require("./routes/publicRoutes");
+const clubRoutes = require("./routes/clubRoutes");
+const platformRoutes = require("./routes/platformRoutes");
 const membershipRoutes = require("./routes/membershipRoutes");
 const voucherRoutes = require("./routes/voucherRoutes");
 const paymentRoutes = require("./routes/paymentRoutes");
@@ -20,6 +22,10 @@ const sportsManagementRoutes = require("./routes/sportsManagementRoutes");
 const coachRoutes = require("./routes/coachRoutes");
 const reportRoutes = require("./routes/reportRoutes");
 const { getPublicAnnouncements } = require("./controllers/publicController");
+const { ensurePlatformOwner } = require("./controllers/platformController");
+
+const { protect } = require("./middleware/authMiddleware");
+const { resolveTenant } = require("./middleware/tenantMiddleware");
 
 const app = express();
 
@@ -65,15 +71,36 @@ app.use(express.urlencoded({ extended: true, limit: "15mb" }));
 // (set the CLOUDINARY_* env vars) - see utils/upload.js.
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-// One-time database bootstrap (connect + schema + seed), shared by every
-// request. On a serverless platform this runs on the first cold-start request.
+// One-time database bootstrap (connect + schema + migrations + seed), shared by
+// every request. On a serverless platform this runs on the first cold-start
+// request.
+//
+// Seeding runs inside the first club's tenant context: the seeded sports,
+// plans and announcements are that club's data, so they must not be written
+// with an empty ClubID (the column default would be null in platform mode).
+//
+// The platform owner account is created last, from PLATFORM_ADMIN_EMAILS, so a
+// fresh deployment can sign into the console without any manual SQL.
+const currentClubId = async () => {
+  const { rows } = await getPool().query(
+    "select ClubID as clubid from Clubs order by ClubID limit 1"
+  );
+  return rows.length ? Number(rows[0].clubid) : null;
+};
+
 let bootstrap = null;
 const ensureDatabase = () => {
   if (!bootstrap) {
     bootstrap = (async () => {
       await connectDB();
       await ensureSchema();
-      await seedInitialData();
+
+      const clubId = await currentClubId();
+      if (clubId) {
+        await runWithTenant({ clubId }, () => seedInitialData());
+      }
+
+      await ensurePlatformOwner();
     })().catch((err) => {
       bootstrap = null;
       throw err;
@@ -92,20 +119,32 @@ app.use(async (req, res, next) => {
 });
 
 // Mount API Routes
+//
+// Two families:
+//   /api/auth, /api/public, /api/platform  -> cross-club (login, website, SaaS)
+//   everything else                         -> club scoped: `protect` resolves the
+//                                              caller and `resolveTenant` opens the
+//                                              row level security bubble for the
+//                                              club carried by the token.
 app.use("/api/auth", authRoutes);
 app.use("/api/public", publicRoutes);
-app.use("/api/membership", membershipRoutes);
-app.use("/api/vouchers", voucherRoutes);
-app.use("/api/payments", paymentRoutes);
-app.use("/api/events", eventRoutes);
-app.use("/api/admin", adminRoutes);
-app.use("/api/notifications", notificationRoutes);
-app.use("/api/sports-management", sportsManagementRoutes);
-app.use("/api/coach", coachRoutes);
-app.use("/api/reports", reportRoutes);
+app.use("/api/platform", platformRoutes);
 
-// Direct announcements endpoint alias
-app.get("/api/announcements", getPublicAnnouncements);
+app.use("/api/club", protect, resolveTenant, clubRoutes);
+app.use("/api/membership", protect, resolveTenant, membershipRoutes);
+app.use("/api/vouchers", protect, resolveTenant, voucherRoutes);
+app.use("/api/payments", protect, resolveTenant, paymentRoutes);
+app.use("/api/events", protect, resolveTenant, eventRoutes);
+app.use("/api/admin", protect, resolveTenant, adminRoutes);
+app.use("/api/notifications", protect, resolveTenant, notificationRoutes);
+app.use("/api/sports-management", protect, resolveTenant, sportsManagementRoutes);
+app.use("/api/coach", protect, resolveTenant, coachRoutes);
+app.use("/api/reports", protect, resolveTenant, reportRoutes);
+
+// Direct announcements endpoint alias (the featured club's public notices)
+app.get("/api/announcements", (req, res, next) =>
+  runWithPlatform(() => getPublicAnnouncements(req, res).catch(next))
+);
 
 // Root Health Check
 app.get("/", (req, res) => {
@@ -163,7 +202,22 @@ const startServer = async () => {
   try {
     await ensureDatabase();
 
-    app.listen(PORT, () => {
+    // Express 5 hands this same callback to the server's "error" event, so the
+    // error has to be checked first. Without this a busy port is reported as a
+    // successful start and the process then exits silently with code 0 - which
+    // is exactly what a second `node server.js` used to look like.
+    app.listen(PORT, (error) => {
+      if (error) {
+        console.error(
+          error.code === "EADDRINUSE"
+            ? `Port ${PORT} is already in use - another copy of the server is still running.\n` +
+                "Stop it first, then start this one again."
+            : "Could not start the HTTP server:"
+        );
+        if (error.code !== "EADDRINUSE") console.error(error);
+        process.exit(1);
+        return;
+      }
       console.log(`Sports Hub Server running on http://localhost:${PORT}`);
     });
   } catch (error) {

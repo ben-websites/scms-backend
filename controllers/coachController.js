@@ -1215,7 +1215,7 @@ const updateCoachProfile = async (req, res) => {
         UPDATE Coaches
         SET Phone = @Phone,
             Bio = @Bio,
-            ImageURL = CASE WHEN @ImageURL IS NULL THEN ImageURL ELSE @ImageURL END
+            ImageURL = COALESCE(@ImageURL, ImageURL)
         WHERE CoachID = @CoachID
       `);
 
@@ -1228,7 +1228,7 @@ const updateCoachProfile = async (req, res) => {
       .query(`
         UPDATE Users
         SET Phone = @Phone,
-            AvatarURL = CASE WHEN @AvatarURL IS NULL THEN AvatarURL ELSE @AvatarURL END
+            AvatarURL = COALESCE(@AvatarURL, AvatarURL)
         WHERE UserID = @UserID
       `);
 

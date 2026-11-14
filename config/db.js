@@ -20,9 +20,77 @@
  */
 const fs = require("fs");
 const path = require("path");
+const { AsyncLocalStorage } = require("node:async_hooks");
 const { Pool, types } = require("pg");
 
 require("dotenv").config({ path: path.resolve(__dirname, "../.env") });
+
+/* ============================================================ tenant context
+ * Multi-tenancy is enforced by PostgreSQL row level security, which reads two
+ * session settings: app.club_id and app.platform_mode. Those are transaction
+ * scoped (set_config(..., true)), so every query batch issued while a tenant
+ * context is active runs on one dedicated client inside its own transaction.
+ *
+ * A batch executed with NO context leaves both settings unset, which makes the
+ * ClubID defaults null and every RLS policy false: nothing is visible. That is
+ * deliberate - a missing tenant must never degrade into "see every club".
+ *
+ * Only two kinds of work run without a club: authentication lookups against
+ * the shared tables (Users / Clubs / ClubUsers), and platform-owner requests,
+ * which opt into platform_mode with runWithPlatform().
+ */
+const tenantStore = new AsyncLocalStorage();
+
+/** Run `fn` with a club context: { clubId }. */
+const runWithTenant = (context, fn) => tenantStore.run(context, fn);
+
+/** Run `fn` with full cross-club visibility (platform owner, bootstrap, seeds). */
+const runWithPlatform = (fn) => tenantStore.run({ platform: true }, fn);
+
+const currentTenant = () => tenantStore.getStore() || null;
+
+/* ========================================================== tenant db role
+ * Neon hands BYPASSRLS to the database owner, and PostgreSQL skips every
+ * policy - even a FORCEd one - for a role that carries it. The owner
+ * connection therefore cannot be trusted with a club's query, so each club
+ * scoped transaction switches into TENANT_DB_ROLE first: a NOLOGIN role with
+ * plain DML grants and no BYPASSRLS, created by db/migrations/003.
+ *
+ * `set local role` is transaction scoped, so the connection is back to the
+ * owner - and can still run the schema DDL on the next boot - as soon as the
+ * batch commits.
+ */
+const TENANT_DB_ROLE = (() => {
+  const role = process.env.TENANT_DB_ROLE || "scms_app";
+  if (!/^[a-z_][a-z0-9_]*$/.test(role)) {
+    throw new Error(`TENANT_DB_ROLE must be a plain SQL identifier, received "${role}".`);
+  }
+  return role;
+})();
+
+const SET_CONTEXT_SQL =
+  "select set_config('app.club_id', $1, true), set_config('app.platform_mode', $2, true)";
+
+const contextValues = (ctx) => [
+  ctx && ctx.clubId != null ? String(ctx.clubId) : "",
+  ctx && ctx.platform ? "true" : "false",
+];
+
+/**
+ * Publishes the request's tenant context to the connection. Call it right
+ * after `begin`, before any statement that touches a club owned table.
+ *
+ * A club context drops to the restricted role; a platform context stays on
+ * the owner, which is what lets the SaaS console and the bootstrap read
+ * across clubs. Failing here is a hard error on purpose: silently continuing
+ * as the owner would hand back the bypass we just removed.
+ */
+const applyTenantContext = async (client, ctx) => {
+  if (ctx && ctx.clubId != null && !ctx.platform) {
+    await client.query(`set local role ${TENANT_DB_ROLE}`);
+  }
+  if (ctx) await client.query(SET_CONTEXT_SQL, contextValues(ctx));
+};
 
 /* ============================================================== type parsers
  * SQL Server handed us plain JS numbers for COUNT(*), DECIMAL and BIGINT.
@@ -366,9 +434,27 @@ const sql = (() => {
   };
 })();
 
+/**
+ * Adds the mssql-shaped `recordset` to a raw `pg` result.
+ *
+ * A pooled query used to return bare `pg` output, so call sites that read
+ * `.recordset` (the legacy public feed in publicController) blew up with
+ * "Cannot read properties of undefined (reading '0')". Keeping `rows` as well
+ * means the raw-pg call sites are untouched.
+ */
+const withRecordset = (result) => {
+  if (result && Array.isArray(result.rows)) {
+    result.recordset = result.rows.map(restoreKeyCasing);
+  }
+  return result;
+};
+
 class Request {
-  constructor() {
+  constructor(client = null) {
     this.inputs = {};
+    // Set when the request belongs to withTransaction(): statements then run
+    // on that transaction instead of acquiring one of their own.
+    this.client = client;
   }
 
   /** Supports both `.input(name, type, value)` and `.input(name, value)`. */
@@ -378,17 +464,14 @@ class Request {
     return this;
   }
 
-  async query(commandText) {
-    const pool = getPool();
-    const translated = translateTsql(String(commandText));
-    const statements = splitStatements(translated);
-
+  /** Executes every statement of the script through one executor. */
+  async runStatements(executor, statements) {
     let rows = [];
     let rowCount = -1;
 
     for (const statement of statements) {
       const { text, values } = bindNamedParams(statement, this.inputs);
-      const result = await pool.query(text, values);
+      const result = await executor.query(text, values);
       rows = result.rows || [];
       rowCount = typeof result.rowCount === "number" ? result.rowCount : rowCount;
     }
@@ -398,6 +481,48 @@ class Request {
       rowsAffected: rowCount,
       output: {},
     };
+  }
+
+  async query(commandText) {
+    const translated = translateTsql(String(commandText));
+    const statements = splitStatements(translated);
+
+    // Already inside withTransaction(): reuse that connection/transaction.
+    if (this.client) {
+      return this.runStatements(
+        { query: (text, values) => this.client.query(text, values) },
+        statements
+      );
+    }
+
+    const ctx = currentTenant();
+
+    // No tenant context: plain pooled call. RLS-protected tables return
+    // nothing, shared tables behave normally.
+    if (!ctx) {
+      return this.runStatements(getRawPool(), statements);
+    }
+
+    const client = await getRawPool().connect();
+    try {
+      await client.query("begin");
+      await applyTenantContext(client, ctx);
+      const result = await this.runStatements(
+        { query: (text, values) => client.query(text, values) },
+        statements
+      );
+      await client.query("commit");
+      return result;
+    } catch (error) {
+      try {
+        await client.query("rollback");
+      } catch {
+        /* connection already gone */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   /** mssql compatibility no-ops */
@@ -412,7 +537,29 @@ class PoolAdapter {
   }
 
   async query(text, values) {
-    return getRawPool().query(text, values);
+    const ctx = currentTenant();
+
+    // DDL and migrations run through here; honour the context when one is
+    // active so a bootstrap/seed is not blocked by row level security.
+    if (!ctx) return withRecordset(await getRawPool().query(text, values));
+
+    const client = await getRawPool().connect();
+    try {
+      await client.query("begin");
+      await applyTenantContext(client, ctx);
+      const result = await client.query(text, values);
+      await client.query("commit");
+      return withRecordset(result);
+    } catch (error) {
+      try {
+        await client.query("rollback");
+      } catch {
+        /* connection already gone */
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   /** Graceful shutdown for one-off scripts (`pool.end()` as mssql had it). */
@@ -426,6 +573,42 @@ class PoolAdapter {
 
   get connected() {
     return true;
+  }
+}
+
+/**
+ * Runs `fn` inside a single database transaction.
+ *
+ * `fn` receives a transaction handle with mssql-compatible `request()` and a
+ * raw `query()`. Anything that must be all-or-nothing (a club subscription
+ * being approved, for example) goes through here instead of several
+ * independent `getPool().request()` calls.
+ */
+async function withTransaction(fn) {
+  const client = await getRawPool().connect();
+  try {
+    await client.query("begin");
+
+    const ctx = currentTenant();
+    await applyTenantContext(client, ctx);
+
+    const tx = {
+      request: () => new Request(client),
+      query: (text, values) => client.query(text, values),
+    };
+
+    const result = await fn(tx);
+    await client.query("commit");
+    return result;
+  } catch (error) {
+    try {
+      await client.query("rollback");
+    } catch {
+      /* connection already gone */
+    }
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
@@ -495,4 +678,14 @@ const connectDB = async () => {
 
 const getPool = () => adapter;
 
-module.exports = { sql, connectDB, getPool, translateTsql, restoreKeyCasing };
+module.exports = {
+  sql,
+  connectDB,
+  getPool,
+  translateTsql,
+  restoreKeyCasing,
+  runWithTenant,
+  runWithPlatform,
+  currentTenant,
+  withTransaction,
+};

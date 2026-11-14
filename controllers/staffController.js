@@ -122,6 +122,15 @@ const provisionCoachLogin = async (req, res) => {
 
     await pool
       .request()
+      .input("UserID", sql.Int, userId)
+      .query(`
+        INSERT INTO ClubUsers (ClubID, UserID, Role, IsActive, JoinedAt)
+        VALUES (current_club(), @UserID, 'coach', 1, SYSDATETIME())
+        ON CONFLICT (ClubID, UserID) DO UPDATE SET Role = 'coach', IsActive = 1
+      `);
+
+    await pool
+      .request()
       .input("CoachID", sql.Int, coachId)
       .input("UserID", sql.Int, userId)
       .input("Email", sql.NVarChar(150), normalizedEmail)
@@ -228,6 +237,16 @@ const createCoachWithStaff = async (req, res) => {
       `);
 
     const coachId = coachRes.recordset[0].CoachID;
+
+    // A coach can only reach this club's dashboard through ClubUsers.
+    await pool
+      .request()
+      .input("UserID", sql.Int, userId)
+      .query(`
+        INSERT INTO ClubUsers (ClubID, UserID, Role, IsActive, JoinedAt)
+        VALUES (current_club(), @UserID, 'coach', 1, SYSDATETIME())
+        ON CONFLICT (ClubID, UserID) DO UPDATE SET Role = 'coach', IsActive = 1
+      `);
 
     await pool
       .request()
@@ -515,7 +534,7 @@ const markStaffAttendance = async (req, res) => {
         IF EXISTS (
           SELECT 1 FROM StaffAttendance
           WHERE StaffType = @StaffType AND CoachID = @CoachID AND AttendanceDate = @AttendanceDate
-            AND ((@TrainerID IS NULL AND TrainerID IS NULL) OR TrainerID = @TrainerID)
+            AND TrainerID IS NOT DISTINCT FROM @TrainerID
         )
         BEGIN
           UPDATE StaffAttendance
@@ -671,17 +690,18 @@ const paySalaries = async (req, res) => {
       const trainerId = staffType === "Trainer" ? parseInt(record.trainerId, 10) : null;
       if (!coachId || (staffType === "Trainer" && !trainerId)) continue;
 
-      const salaryRes = await pool
-        .request()
-        .input("CoachID", sql.Int, coachId)
-        .input("TrainerID", sql.Int, trainerId)
-        .query(`
-          SELECT
-            CASE WHEN @TrainerID IS NULL
-              THEN (SELECT MonthlySalary FROM Coaches WHERE CoachID = @CoachID)
-              ELSE (SELECT MonthlySalary FROM Trainers WHERE TrainerID = @TrainerID)
-            END AS BaseSalary
-        `);
+      // A trainer is paid from Trainers, a coach from Coaches. Branching here
+      // instead of in SQL keeps the parameter typed: a bare "@Id IS NULL" gives
+      // Postgres nothing to infer the parameter type from (error 42P08).
+      const salaryRes = trainerId
+        ? await pool
+            .request()
+            .input("TrainerID", sql.Int, trainerId)
+            .query("SELECT MonthlySalary AS BaseSalary FROM Trainers WHERE TrainerID = @TrainerID")
+        : await pool
+            .request()
+            .input("CoachID", sql.Int, coachId)
+            .query("SELECT MonthlySalary AS BaseSalary FROM Coaches WHERE CoachID = @CoachID");
 
       const base = Number(salaryRes.recordset[0]?.BaseSalary) || 0;
 
@@ -698,7 +718,7 @@ const paySalaries = async (req, res) => {
             SUM(CASE WHEN Status = 'Absent' THEN 1 ELSE 0 END) AS AbsentDays
           FROM StaffAttendance
           WHERE StaffType = @StaffType AND CoachID = @CoachID
-            AND ((@TrainerID IS NULL AND TrainerID IS NULL) OR TrainerID = @TrainerID)
+            AND TrainerID IS NOT DISTINCT FROM @TrainerID
             AND MONTH(AttendanceDate) = @Month AND YEAR(AttendanceDate) = @Year
         `);
 
@@ -719,7 +739,7 @@ const paySalaries = async (req, res) => {
         .query(`
           SELECT SalaryPaymentID FROM SalaryPayments
           WHERE StaffType = @StaffType AND CoachID = @CoachID
-            AND ((@TrainerID IS NULL AND TrainerID IS NULL) OR TrainerID = @TrainerID)
+            AND TrainerID IS NOT DISTINCT FROM @TrainerID
             AND SalaryMonth = @Month AND SalaryYear = @Year
         `);
 

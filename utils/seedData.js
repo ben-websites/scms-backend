@@ -34,7 +34,7 @@ const seedInitialData = async () => {
         .query(`
           INSERT INTO ClubSettings (SettingKey, SettingValue, Description)
           VALUES (@Key, @Value, @Desc)
-          ON CONFLICT (SettingKey) DO NOTHING
+          ON CONFLICT (ClubID, SettingKey) DO NOTHING
         `);
     }
 
